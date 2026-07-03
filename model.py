@@ -5,8 +5,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 class TravelAIAgent:
     def __init__(self, df_cities, df_planner, df_rec, df_agency):
-        self.df_cities = df_cities
-        self.df_planner = df_planner
+        # Clean columns immediately by forcing them to lowercase to prevent KeyErrors
+        self.df_cities = df_cities.copy()
+        self.df_cities.columns = [str(c).lower().strip() for c in self.df_cities.columns]
+        
+        self.df_planner = df_planner.copy()
+        self.df_planner.columns = [str(c).lower().strip() for c in self.df_planner.columns]
+        
         self.df_rec = df_rec
         self.df_agency = df_agency
         
@@ -20,17 +25,10 @@ class TravelAIAgent:
         self.vectorizer.fit(self.planner_corpus)
         self.planner_matrix = self.vectorizer.transform(self.planner_corpus)
 
-        # DEFENSIVE LOOKUP: Automatically find the "City" column regardless of formatting or casing
-        self.city_col = None
-        for col in self.df_cities.columns:
-            if 'city' in col.lower():
-                self.city_col = col
-                break
-        # Fallback to the second column if no 'city' keyword matches explicitly
-        if not self.city_col and len(self.df_cities.columns) > 1:
-            self.city_col = self.df_cities.columns[1]
-        elif not self.city_col:
-            self.city_col = self.df_cities.columns[0]
+        # Map correct semantic columns out safely
+        self.city_col = 'city' if 'city' in self.df_cities.columns else self.df_cities.columns[0]
+        self.dest_col = 'destination_name' if 'destination_name' in self.df_planner.columns else \
+                        ('destination' if 'destination' in self.df_planner.columns else self.df_planner.columns[0])
 
     def extract_entities(self, user_input):
         """
@@ -45,7 +43,7 @@ class TravelAIAgent:
         duration_match = re.search(r'(\d+)\s*(?:day|night)', user_input_lower)
         duration = int(duration_match.group(1)) if duration_match else None
         
-        # Match cities dynamically using the auto-detected column signature
+        # Match cities dynamically using the sanitized lowercase column mapping
         detected_destination = "Unknown"
         if self.city_col in self.df_cities.columns:
             for city in self.df_cities[self.city_col].dropna().unique():
@@ -67,21 +65,28 @@ class TravelAIAgent:
         destination = entities["destination"]
         budget = entities["budget"]
         
-        # Dynamically locate the Destination reference column in the planner dataset
-        dest_col = None
-        for col in self.df_planner.columns:
-            if 'dest' in col.lower():
-                dest_col = col
-                break
-        if not dest_col:
-            dest_col = self.df_planner.columns[0]
-            
         # Try finding structural match first
-        matches = self.df_planner[self.df_planner[dest_col].str.contains(destination, case=False, na=False)] if destination != "Unknown" else pd.DataFrame()
+        if destination != "Unknown" and self.dest_col in self.df_planner.columns:
+            matches = self.df_planner[self.df_planner[self.dest_col].str.contains(destination, case=False, na=False)]
+        else:
+            matches = pd.DataFrame()
         
-        if budget and not matches.empty:
-            if 'Cost' in matches.columns:
-                matches = matches[matches['Cost'] <= budget]
+        # Cost lookup safety checks (handles variation variations like 'flight_transport_cost_usd')
+        cost_col = None
+        for col in self.df_planner.columns:
+            if 'cost' in col or 'price' in col:
+                cost_col = col
+                break
+                
+        if budget and not matches.empty and cost_col:
+            try:
+                # Convert column to numeric values cleanly for filtering expressions
+                matches[cost_col] = pd.to_numeric(matches[cost_col], errors='coerce')
+                filtered_matches = matches[matches[cost_col] <= budget]
+                if not filtered_matches.empty:
+                    matches = filtered_matches
+            except:
+                pass
         
         # Similarity RAG backup context calculation
         input_vector = self.vectorizer.transform([user_input])
@@ -89,11 +94,10 @@ class TravelAIAgent:
         top_index = similarities.argsort()[-1]
         rag_fallback = self.df_planner.iloc[top_index].to_dict()
         
-        # Attempt to gather specific visa text
+        # Attempt to gather specific visa text from schema attributes
         visa_info = "Visa requirement details not explicitly found. A human specialist will double-check."
         for col in self.df_planner.columns:
-            if 'visa' in col.lower():
-                # Use current matched subset or fallback to top rag candidate item
+            if 'visa' in col:
                 target_source = matches if not matches.empty else pd.DataFrame([rag_fallback])
                 visa_info = f"Based on historical data: {target_source[col].iloc[0]}"
                 break
@@ -114,13 +118,14 @@ class TravelAIAgent:
         output += "I searched our matching inventory based strictly on your preferences:\n\n"
         
         for idx, tour in enumerate(tours, 1):
-            # Attempt to gather any identifiable tour descriptive values
-            name = tour.get('TourName', tour.get('PackageName', tour.get('City', tour.get('Destination', f"Custom Package Plan {idx}"))))
-            cost = tour.get('Cost', tour.get('Price', tour.get('Budget', 'Quote on Request')))
-            days = tour.get('Duration', tour.get('Days', entities['duration'] or 'Flexible'))
-            output += f"- **Option {idx}: {name}** | Duration: {days} Days/Setting | Cost Estimate: {cost}\n"
+            # Fallback chains to capture descriptive fields dynamically
+            name = tour.get('destination_name', tour.get('city', tour.get('destination', f"Custom Package Plan {idx}")))
+            cost = tour.get('flight_transport_cost_usd', tour.get('cost', tour.get('price', 'Quote on Request')))
+            days = tour.get('recommended_stay_days', tour.get('duration', entities['duration'] or 'Flexible'))
             
-        output += f"\n📋 **Visa Information:**\n> {visa}\n\n"
+            output += f"- **Option {idx}: {str(name).title()}** | Duration: {days} Days | Base Transport Cost: ${cost}\n"
+            
+        output += f"\n📋 **Visa Policy Guideline:**\n> {visa}\n\n"
         output += "Would you like to hand this over to our human sales team to secure your booking dates?"
         
         return output
