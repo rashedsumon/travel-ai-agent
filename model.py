@@ -12,8 +12,12 @@ class TravelAIAgent:
         
         # Prepare lightweight vectorizer for matching travel rules/visas
         self.vectorizer = TfidfVectorizer(stop_words='english')
-        # Combine relevant data fields for string context comparisons
-        self.planner_corpus = self.df_planner.astype(str).agg(' '.join, axis=1).tolist()
+        
+        # FIX: Explicitly cast to string and fill missing values (NaN) with an empty string
+        # This prevents Python's .join framework from crashing on hidden float NaNs
+        clean_planner_df = self.df_planner.astype(str).fillna("")
+        self.planner_corpus = clean_planner_df.agg(' '.join, axis=1).tolist()
+        
         self.vectorizer.fit(self.planner_corpus)
         self.planner_matrix = self.vectorizer.transform(self.planner_corpus)
 
@@ -55,7 +59,6 @@ class TravelAIAgent:
         matches = self.df_planner[self.df_planner['Destination'].str.contains(destination, case=False, na=False)]
         
         if budget:
-            # Look for cost rows if they exist in dataset schema (Fallback: fallback to destination filter)
             if 'Cost' in matches.columns:
                 matches = matches[matches['Cost'] <= budget]
         
@@ -86,7 +89,6 @@ class TravelAIAgent:
         
         dest = entities['destination'] if entities['destination'] != "Unknown" else "your requested destination"
         
-        # Build natural language narrative response anchored purely on data constraints
         output = f"### ✈️ AI Travel Assistant Options for {dest.title()}\n\n"
         output += "I searched our matching inventory based strictly on your preferences:\n\n"
         
