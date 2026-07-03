@@ -13,13 +13,24 @@ class TravelAIAgent:
         # Prepare lightweight vectorizer for matching travel rules/visas
         self.vectorizer = TfidfVectorizer(stop_words='english')
         
-        # FIX: Explicitly cast to string and fill missing values (NaN) with an empty string
-        # This prevents Python's .join framework from crashing on hidden float NaNs
+        # Clean up strings and safely handle empty/missing data points
         clean_planner_df = self.df_planner.astype(str).fillna("")
         self.planner_corpus = clean_planner_df.agg(' '.join, axis=1).tolist()
         
         self.vectorizer.fit(self.planner_corpus)
         self.planner_matrix = self.vectorizer.transform(self.planner_corpus)
+
+        # DEFENSIVE LOOKUP: Automatically find the "City" column regardless of formatting or casing
+        self.city_col = None
+        for col in self.df_cities.columns:
+            if 'city' in col.lower():
+                self.city_col = col
+                break
+        # Fallback to the second column if no 'city' keyword matches explicitly
+        if not self.city_col and len(self.df_cities.columns) > 1:
+            self.city_col = self.df_cities.columns[1]
+        elif not self.city_col:
+            self.city_col = self.df_cities.columns[0]
 
     def extract_entities(self, user_input):
         """
@@ -34,12 +45,13 @@ class TravelAIAgent:
         duration_match = re.search(r'(\d+)\s*(?:day|night)', user_input_lower)
         duration = int(duration_match.group(1)) if duration_match else None
         
-        # Match cities based on our downloaded Cities Database
+        # Match cities dynamically using the auto-detected column signature
         detected_destination = "Unknown"
-        for city in self.df_cities['City'].dropna().unique():
-            if city.lower() in user_input_lower:
-                detected_destination = city
-                break
+        if self.city_col in self.df_cities.columns:
+            for city in self.df_cities[self.city_col].dropna().unique():
+                if str(city).lower() in user_input_lower:
+                    detected_destination = str(city)
+                    break
                 
         return {
             "destination": detected_destination,
@@ -55,10 +67,19 @@ class TravelAIAgent:
         destination = entities["destination"]
         budget = entities["budget"]
         
+        # Dynamically locate the Destination reference column in the planner dataset
+        dest_col = None
+        for col in self.df_planner.columns:
+            if 'dest' in col.lower():
+                dest_col = col
+                break
+        if not dest_col:
+            dest_col = self.df_planner.columns[0]
+            
         # Try finding structural match first
-        matches = self.df_planner[self.df_planner['Destination'].str.contains(destination, case=False, na=False)]
+        matches = self.df_planner[self.df_planner[dest_col].str.contains(destination, case=False, na=False)] if destination != "Unknown" else pd.DataFrame()
         
-        if budget:
+        if budget and not matches.empty:
             if 'Cost' in matches.columns:
                 matches = matches[matches['Cost'] <= budget]
         
@@ -70,12 +91,12 @@ class TravelAIAgent:
         
         # Attempt to gather specific visa text
         visa_info = "Visa requirement details not explicitly found. A human specialist will double-check."
-        for col in matches.columns:
+        for col in self.df_planner.columns:
             if 'visa' in col.lower():
-                visa_info = f"Based on historical data: {matches[col].iloc[0]}"
+                # Use current matched subset or fallback to top rag candidate item
+                target_source = matches if not matches.empty else pd.DataFrame([rag_fallback])
+                visa_info = f"Based on historical data: {target_source[col].iloc[0]}"
                 break
-        if "visa" in str(rag_fallback).lower() and visa_info.startswith("Visa requirement"):
-            visa_info = f"Retrieved guidelines: {rag_fallback.get('Visa', 'Standard short-stay policies apply.')}"
 
         tour_options = matches.head(2).to_dict(orient='records') if not matches.empty else [rag_fallback]
         return tour_options, visa_info
@@ -93,10 +114,11 @@ class TravelAIAgent:
         output += "I searched our matching inventory based strictly on your preferences:\n\n"
         
         for idx, tour in enumerate(tours, 1):
-            name = tour.get('TourName', tour.get('PackageName', f"Custom Package Plan {idx}"))
-            cost = tour.get('Cost', tour.get('Price', 'Quote on Request'))
-            days = tour.get('Duration', entities['duration'] or 'Flexible')
-            output += f"- **Option {idx}: {name}** | Duration: {days} Days | Cost Estimate: ${cost}\n"
+            # Attempt to gather any identifiable tour descriptive values
+            name = tour.get('TourName', tour.get('PackageName', tour.get('City', tour.get('Destination', f"Custom Package Plan {idx}"))))
+            cost = tour.get('Cost', tour.get('Price', tour.get('Budget', 'Quote on Request')))
+            days = tour.get('Duration', tour.get('Days', entities['duration'] or 'Flexible'))
+            output += f"- **Option {idx}: {name}** | Duration: {days} Days/Setting | Cost Estimate: {cost}\n"
             
         output += f"\n📋 **Visa Information:**\n> {visa}\n\n"
         output += "Would you like to hand this over to our human sales team to secure your booking dates?"
